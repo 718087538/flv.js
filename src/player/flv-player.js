@@ -87,6 +87,23 @@ class FlvPlayer {
         if (this._alwaysSeekKeyframe) {
             this._config.accurateSeek = false;
         }
+
+
+        
+        //每 M 秒计算一下延迟追赶发生的次数
+        // >= N次，认为调整次数太频繁，_maxDurationGap一次性增加 K 秒
+        // 0~N次，发生追赶，但不算频繁，_maxDurationGap少量增加 P 秒
+        // == 0次，认为拉流数据较为平滑，未发生追赶，_maxDurationGap下调 P 秒
+        // M,N,K,P为可配参数，K建议大一点，P建议小一点
+        this._latencyDetectInterval = this._config.latencyDetectInterval;   //M, 毫秒
+        this._latencyDetectThreshold = this._config.latencyDetectThreshold; //N
+        this._latencyDetectIncreaseStep = this._config.latencyDetectIncreaseStep;   //K
+        this._latencyDetectAdjustStep = this._config.latencyDetectAdjustStep;   //P 
+        this._latencyDetectAdjustFactor = this._config.latencyDetectAdjustFactor;  //增加 P 秒的时间间隔因子，即多少个_latencyDetectInterval才触发一次上调
+
+        this._latencyDetectTimer = null;
+        this._latencyAdjustCount = 0;
+        this._latencyAdjustFactor = 0;
     }
 
     destroy() {
@@ -205,7 +222,19 @@ class FlvPlayer {
             // IE11 may throw InvalidStateError if readyState === 0
             this._mediaElement.currentTime = 0;
         }
+        if (this._enableDurationMonitor && (this._durationMonitor == null)) {
+            this._durationMonitor = self.setInterval(this._doDurationMonitor.bind(this), this._videoStateMonitorInterval);
+            if (this._latencyDetectTimer) {
+                self.clearInterval(this._latencyDetectTimer);
+                this._latencyDetectTimer = null;
+                this._latencyAdjustCount = 0;
+            }
+            
+            this._forzenTimes = 0;
+            this._lastDecodedFrames = 0;
 
+            this._latencyDetectTimer = self.setInterval(this._adjustDurationGap.bind(this), this._latencyDetectInterval);
+        }
         this._transmuxer = new Transmuxer(this._mediaDataSource, this._config);
 
         this._transmuxer.on(TransmuxingEvents.INIT_SEGMENT, (type, is) => {
@@ -368,6 +397,31 @@ class FlvPlayer {
 
         return statInfo;
     }
+    _increaseLatencyAdjust(second) {
+        this._maxDurationGap += second;
+        Log.d(this.TAG, '+' + this._maxDurationGap);
+    }
+
+    _decreaseLatencyAdjust(second) {
+        this._maxDurationGap -= second;
+        if (this._maxDurationGap < this._config.maxDurationGap) {
+            this._maxDurationGap = this._config.maxDurationGap;
+        }
+        Log.d(this.TAG, '-' + this._maxDurationGap);
+    }
+
+    _adjustDurationGap() {
+        if (this._latencyAdjustCount >= this._latencyDetectThreshold) {
+            this._increaseLatencyAdjust(this._latencyDetectIncreaseStep);
+        } else if (this._latencyAdjustCount == 0) {
+            ++this._latencyAdjustFactor;
+            if (this._latencyAdjustFactor >= this._latencyDetectAdjustFactor) {
+                this._latencyAdjustFactor = 0;
+                this._decreaseLatencyAdjust(this._latencyDetectAdjustStep);
+            }
+        }
+        this._latencyAdjustCount = 0;
+    }
 
     _onmseUpdateEnd() {
         if (!this._config.lazyLoad || this._config.isLive) {
@@ -498,6 +552,77 @@ class FlvPlayer {
             if (this._config.accurateSeek) {
                 this._requestSetTime = true;
                 this._mediaElement.currentTime = seconds;
+            }
+        }
+    }
+    _doDurationMonitor() {
+
+        // Log.d(this.TAG, '_doDurationMonitor, decoded_frames:' + decoded_frames);
+        if (!this._enableDurationMonitor || !this._mseSourceOpened) {
+            return;
+        }
+
+        if (this._msectl && this._msectl.checkSourceBufferNull()) {
+            return; 
+        }
+
+        let buffered = this._mediaElement.buffered;
+        let currentTime = this._mediaElement.currentTime;
+        let isPaused = this._mediaElement.paused;
+
+        if (buffered == null || buffered.length == 0) {
+            return;
+        }
+
+        let buffer_end = buffered.end(0);
+        let current_play_delta = buffer_end - currentTime;
+
+        // check duration
+        if (!isPaused && current_play_delta > this._maxDurationGap) {
+            //当前播放点与缓冲区末尾相差超过阈值，追赶
+            //当前播放点与缓冲区末尾相差超过阈值，追赶
+            let newGap = buffer_end - this._decreaseDurationStep;
+            Log.w(this.TAG, 'large duration {' + current_play_delta 
+                + '}, reduce ' + this._decreaseDurationStep + ' and set to ' + newGap);
+            this._mediaElement.currentTime = newGap;
+            this._requestSetTime = true;
+
+            ++this._latencyAdjustCount;
+            this._increaseLatencyAdjust(this._latencyDetectAdjustStep);    //立刻上调一点
+        }
+
+        // check video frozen or not
+        if (this._enableVideoFrozenMonitor) {
+
+            // get current decoded frames count
+            let decoded_frames = 0;
+            if (this._mediaElement.getVideoPlaybackQuality) {
+                let quality = this._mediaElement.getVideoPlaybackQuality();
+                decoded_frames = quality.totalVideoFrames;
+            } else if (this._mediaElement.webkitDecodedFrameCount != undefined) {
+                decoded_frames = this._mediaElement.webkitDecodedFrameCount;
+            } else {
+                // could not get decoded frames count
+                return;
+            }
+            
+            if (this._lastDecodedFrames != 0) {
+                //check whether video frozen or not
+                if (this._lastDecodedFrames == decoded_frames) {
+                    this._forzenTimes++;
+                    // Log.w(this.TAG, '--== Video decoded frames stop increase, check count:' + this._forzenTimes);
+                } else {
+                    this._forzenTimes = 0;
+                }
+            }
+            // Log.d(this.TAG, '--== decoded frame {last:' + this._lastDecodedFrames + ', cur:' + decoded_frames + '}');
+            this._lastDecodedFrames = decoded_frames;
+
+            if (this._forzenTimes >= this._frozenTimesThreshold) {
+                // equals to threshold, emit VIDEO_FROZEN event
+                Log.w(this.TAG, 'Report video frozen event');
+                this._emitter.emit(PlayerEvents.VIDEO_FROZEN);
+                this._forzenTimes = 0;
             }
         }
     }
